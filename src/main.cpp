@@ -69,7 +69,7 @@ void setup() {
   SerialMon.print("Modem Revision: ");
   SerialMon.println(modem.getModemRevision());
   SerialMon.print("Modem IMEI: ");
-  SerialMon.println(modem.getModemSerialNumber());
+  SerialMon.println(modem.getIMEI());
   SerialMon.print("Modem ICCID: ");
   SerialMon.println(modem.getSimCCID());
   SerialMon.print("SIM Status: ");
@@ -89,10 +89,16 @@ void setup() {
     delay(delayTime);
   }
 
+  if (retryCount == maxRetries) {
+    SerialMon.println("Failed to register to network after maximum retries");
+    return;
+  }
+
   // ネットワーク接続成功
   SerialMon.println("Network registered successfully");
   SerialMon.print("Network Operator: ");
   SerialMon.println(modem.getOperator());
+
   //信号品質の取得
   int8_t csq = modem.getSignalQuality();
   SerialMon.print("Signal quality: ");
@@ -111,6 +117,11 @@ void setup() {
   SerialMon.print("Local IP: ");
   SerialMon.println(localIP);
 
+  // UDPソケットをクローズ
+  SerialMon.println("Closing any existing UDP socket...");
+  modem.sendAT("+CACLOSE=0");
+  modem.waitResponse(10000L);
+
   // UDPソケットを開く（ATコマンド使用）
   SerialMon.println("Opening UDP socket...");
   // ATコマンド送信
@@ -127,10 +138,51 @@ void setup() {
       char c = SerialAT.read();
       SerialMon.print(c); // レスポンスを1文字ずつ出力
     }
-  SerialMon.println(); // 改行
+    SerialMon.println(); // 改行
   }
 }
 
+void sendData(uint8_t* payload, size_t payloadSize) {
+  int maxRetries = 3;
+  for (int attempt = 0; attempt < maxRetries; attempt++) {
+    // データ送信ATコマンド
+    modem.sendAT("+CASEND=0," + String(payloadSize));
+    if (modem.waitResponse(">") != 1) {
+      SerialMon.println("Failed to initiate data send, retrying...");
+      
+      // UDPソケットをクローズ
+      SerialMon.println("Closing existing UDP socket...");
+      modem.sendAT("+CACLOSE=0");
+      modem.waitResponse(10000L);
+
+      // UDPソケットを再度開く
+      SerialMon.println("Reopening UDP socket...");
+      modem.sendAT("+CAOPEN=0,0,\"UDP\",\"" + String(udpServer) + "\"," + String(udpPort));
+      int response = modem.waitResponse(10000L); // 最大10秒待機
+
+      if (response != 1) {
+        SerialMon.println("Failed to reopen UDP socket. AT Response:");
+        while (SerialAT.available()) {
+          char c = SerialAT.read();
+          SerialMon.print(c); // レスポンスを1文字ずつ出力
+        }
+        SerialMon.println(); // 改行
+        continue; // 次のリトライへ
+      }
+    } else {
+      SerialAT.write(payload, payloadSize);
+      if (modem.waitResponse() != 1) {
+        SerialMon.println("Failed to send data, retrying...");
+        continue; // 次のリトライへ
+      }
+
+      SerialMon.println("Data sent successfully!");
+      return; // 成功したので終了
+    }
+  }
+
+  SerialMon.println("Failed to send data after maximum retries");
+}
 
 void loop() {
   unsigned long current = millis();
@@ -151,21 +203,7 @@ void loop() {
       // co2::float:32:little-endian Temp::float:32:little-endian Humi::float:32:little-endian
 
       SerialMon.println("Sending data...");
-
-      // データ送信ATコマンド
-      modem.sendAT("+CASEND=0," + String(sizeof(payload)));
-      if (modem.waitResponse(">") != 1) {
-        SerialMon.println("Failed to initiate data send");
-        return;
-      }
-
-      SerialAT.write(payload, sizeof(payload));
-      if (modem.waitResponse() != 1) {
-        SerialMon.println("Failed to send data");
-        return;
-      }
-
-      SerialMon.println("Data sent successfully!");
+      sendData(payload, sizeof(payload));
 
       M5.Lcd.clear(BLACK);
       M5.Lcd.setCursor(0, 0);
