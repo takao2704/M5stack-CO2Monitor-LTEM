@@ -7,6 +7,8 @@
 #define TINY_GSM_MODEM_SIM7080
 #include <TinyGsmClient.h>
 
+#include <stdlib.h>
+
 // インスタンス生成
 SCD4x scd40;
 
@@ -20,8 +22,10 @@ unsigned long lastUpdate = 0;
 #define SerialAT Serial2
 #define ENDPOINT "uni.soracom.io"
 
+const char udpServer[] = "uni.soracom.io"; // サーバーのIPアドレス
+const uint16_t udpPort = 23080;         // サーバーのポート番号
+
 TinyGsm modem(SerialAT);
-TinyGsmClient client(modem);
 
 void setup() {
   // --- M5Stackの初期化 ---
@@ -107,7 +111,26 @@ void setup() {
   SerialMon.print("Local IP: ");
   SerialMon.println(localIP);
 
+  // UDPソケットを開く（ATコマンド使用）
+  SerialMon.println("Opening UDP socket...");
+  // ATコマンド送信
+  modem.sendAT("+CAOPEN=0,0,\"UDP\",\"" + String(udpServer) + "\"," + String(udpPort));
+
+  // レスポンスを取得して詳細を表示
+  int response = modem.waitResponse(10000L); // 最大10秒待機
+
+  if (response == 1) {
+    SerialMon.println("UDP socket opened successfully!");
+  } else {
+    SerialMon.println("Failed to open UDP socket. AT Response:");
+    while (SerialAT.available()) {
+      char c = SerialAT.read();
+      SerialMon.print(c); // レスポンスを1文字ずつ出力
+    }
+  SerialMon.println(); // 改行
+  }
 }
+
 
 void loop() {
   unsigned long current = millis();
@@ -118,6 +141,31 @@ void loop() {
       float co2 = scd40.getCO2();
       float temp = scd40.getTemperature();
       float humidity = scd40.getHumidity();
+
+      // データをバイナリ形式でパッキング
+      uint8_t payload[12];
+      memcpy(payload, &co2, sizeof(co2));
+      memcpy(payload + 4, &temp, sizeof(temp));
+      memcpy(payload + 8, &humidity, sizeof(humidity));
+      // この場合はバイナリパーサーでパースする必要がある
+      // co2::float:32:little-endian Temp::float:32:little-endian Humi::float:32:little-endian
+
+      SerialMon.println("Sending data...");
+
+      // データ送信ATコマンド
+      modem.sendAT("+CASEND=0," + String(sizeof(payload)));
+      if (modem.waitResponse(">") != 1) {
+        SerialMon.println("Failed to initiate data send");
+        return;
+      }
+
+      SerialAT.write(payload, sizeof(payload));
+      if (modem.waitResponse() != 1) {
+        SerialMon.println("Failed to send data");
+        return;
+      }
+
+      SerialMon.println("Data sent successfully!");
 
       M5.Lcd.clear(BLACK);
       M5.Lcd.setCursor(0, 0);
