@@ -224,6 +224,16 @@ void fetchSubscriberInfo() {
 void setup() {
   // --- M5Stackの初期化 ---
   M5.begin();
+  
+  // === デバッグ情報の出力（フラッシュサイズ問題の診断用） ===
+  SerialMon.println("=== FLASH DEBUG INFO ===");
+  SerialMon.printf("Flash chip size: %d bytes (%d KB)\n", ESP.getFlashChipSize(), ESP.getFlashChipSize() / 1024);
+  SerialMon.printf("Flash chip speed: %d Hz\n", ESP.getFlashChipSpeed());
+  SerialMon.printf("Flash chip mode: %d\n", ESP.getFlashChipMode());
+  SerialMon.printf("Sketch size: %d bytes\n", ESP.getSketchSize());
+  SerialMon.printf("Free sketch space: %d bytes\n", ESP.getFreeSketchSpace());
+  SerialMon.printf("Chip ID: %08X\n", (uint32_t)(ESP.getEfuseMac() >> 32));
+  SerialMon.println("========================");
 
   // --- I2C初期化 (PortAのSDA=21, SCL=22) ---
   Wire.begin(21, 22);
