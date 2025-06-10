@@ -90,7 +90,7 @@ graph LR
 - 使用ライブラリ:
   - m5stack/M5Stack@^0.4.6
   - sparkfun/SparkFun SCD4x Arduino Library@^1.1.2
-  - 独自実装のFS3000ライブラリ（SparkFun公式仕様準拠）
+  - sparkfun/SparkFun_FS3000_Arduino_Library@^1.0.5
   - Seeed Arduino BME68x
   - TinyGSM
   - arduino-libraries/ArduinoHttpClient@^0.4.0
@@ -129,12 +129,13 @@ graph LR
        lib_deps =
            m5stack/M5Stack@^0.4.6
            sparkfun/SparkFun SCD4x Arduino Library@^1.1.2
+           sparkfun/SparkFun_FS3000_Arduino_Library@^1.0.5
            https://github.com/Seeed-Studio/Seeed_Arduino_BME68x.git
            https://github.com/vshymanskyy/TinyGSM.git
            arduino-libraries/ArduinoHttpClient@^0.4.0
            bblanchon/ArduinoJson@^6.21.3
        ```
-     - `src/main.cpp`、`src/FS3000.h`、`src/FS3000.cpp`にプロジェクトのソースコードをコピー
+     - `src/main.cpp`にプロジェクトのソースコードをコピー
 
 3. **ハードウェアの接続**
    - SCD40センサーをGroveケーブルでM5Stack CoreのポートAに接続

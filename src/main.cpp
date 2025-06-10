@@ -3,7 +3,7 @@
 #include <M5Stack.h>
 #include <Wire.h>
 #include "SparkFun_SCD4x_Arduino_Library.h"
-#include "FS3000.h"
+#include "SparkFun_FS3000_Arduino_Library.h"
 
 #define TINY_GSM_MODEM_SIM7080
 #include <TinyGsmClient.h>
@@ -74,7 +74,7 @@ void readAndSendData() {
   windSpeed = fs3000.readMetersPerSecond();
   if (windSpeed >= 0) {
     fs3000Success = true;
-    SerialMon.printf("FS3000 Velocity: %.2f m/s\n", windSpeed);
+    SerialMon.printf("FS3000 Raw: %d, Velocity: %.2f m/s\n", fs3000.readRaw(), windSpeed);
   } else {
     SerialMon.println("FS3000 readMetersPerSecond() failed");
   }
@@ -300,12 +300,12 @@ void setup() {
     M5.Lcd.println("FS3000 init failed! Check wiring/address = 0x28");
     SerialMon.println("FS3000 init failed! Check wiring/address = 0x28");
   } else {
+    // FS3000-1005の範囲設定（0-7.23 m/s）
+    fs3000.setRange(AIRFLOW_RANGE_7_MPS);
     M5.Lcd.clear(BLACK);
     M5.Lcd.println("FS3000 Air Velocity Sensor Setup Complete.");
     SerialMon.println("FS3000 Air Velocity Sensor Setup Complete.");
-    
-    // デバッグ: センサー情報を表示
-    fs3000.printSensorInfo();
+    SerialMon.println("FS3000 range set to 0-7.23 m/s (FS3000-1005)");
   }
 
   // --- SIM7080の初期化 ---
