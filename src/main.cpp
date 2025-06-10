@@ -3,6 +3,7 @@
 #include <M5Stack.h>
 #include <Wire.h>
 #include "SparkFun_SCD4x_Arduino_Library.h"
+#include "FS3000.h"
 
 #define TINY_GSM_MODEM_SIM7080
 #include <TinyGsmClient.h>
@@ -13,6 +14,7 @@
 
 // インスタンス生成
 SCD4x scd40;
+FS3000 fs3000;
 
 // センサー読み取り周期 (ミリ秒)
 static unsigned long INTERVAL = 10000; // デフォルト値は10秒
@@ -47,76 +49,115 @@ void sendData(uint8_t* payload, size_t payloadSize);
 bool sendDataWithStatus(uint8_t* payload, size_t payloadSize);
 void resetModem();
 void readAndSendData();
+void scanI2CDevices();
 
 // センサーデータの読み取り、送信、画面更新を行う関数
 void readAndSendData() {
   unsigned long current = millis();
 
+  // SCD40データの取得
+  bool scd40Success = false;
+  float co2 = 0, temp = 0, humidity = 0;
+  
   if (scd40.readMeasurement()) {
-    float co2 = scd40.getCO2();
-    float temp = scd40.getTemperature();
-    float humidity = scd40.getHumidity();
+    co2 = scd40.getCO2();
+    temp = scd40.getTemperature();
+    humidity = scd40.getHumidity();
+    scd40Success = true;
+  }
 
-    // データをバイナリ形式でパッキング
-    uint8_t payload[12];
-    memcpy(payload, &co2, sizeof(co2));
-    memcpy(payload + 4, &temp, sizeof(temp));
-    memcpy(payload + 8, &humidity, sizeof(humidity));
-    // この場合はバイナリパーサーでパースする必要がある
-    // co2::float:32:little-endian Temp::float:32:little-endian Humi::float:32:little-endian
+  // FS3000データの取得
+  bool fs3000Success = false;
+  float windSpeed = 0;
+  
+  // 公式ライブラリの方式を使用
+  windSpeed = fs3000.readMetersPerSecond();
+  if (windSpeed >= 0) {
+    fs3000Success = true;
+    SerialMon.printf("FS3000 Velocity: %.2f m/s\n", windSpeed);
+  } else {
+    SerialMon.println("FS3000 readMetersPerSecond() failed");
+  }
 
-    SerialMon.println("Sending data...");
-    bool sendSuccess = sendDataWithStatus(payload, sizeof(payload));
+  // データをバイナリ形式でパッキング（16バイトに拡張）
+  uint8_t payload[16];
+  memcpy(payload, &co2, sizeof(co2));
+  memcpy(payload + 4, &temp, sizeof(temp));
+  memcpy(payload + 8, &humidity, sizeof(humidity));
+  memcpy(payload + 12, &windSpeed, sizeof(windSpeed));
+  // この場合はバイナリパーサーでパースする必要がある
+  // co2::float:32:little-endian Temp::float:32:little-endian Humi::float:32:little-endian Wind::float:32:little-endian
+
+  SerialMon.println("Sending data...");
+  bool sendSuccess = sendDataWithStatus(payload, sizeof(payload));
+  
+  if (sendSuccess) {
+    // 送信成功
+    consecutiveFailures = 0; // 失敗カウンターをリセット
+    lastSuccessfulSend = current; // 最後の成功送信時間を更新
+  } else {
+    // 送信失敗
+    consecutiveFailures++;
+    SerialMon.printf("Consecutive failures: %d/%d\n", consecutiveFailures, MAX_CONSECUTIVE_FAILURES);
     
-    if (sendSuccess) {
-      // 送信成功
-      consecutiveFailures = 0; // 失敗カウンターをリセット
-      lastSuccessfulSend = current; // 最後の成功送信時間を更新
-    } else {
-      // 送信失敗
-      consecutiveFailures++;
-      SerialMon.printf("Consecutive failures: %d/%d\n", consecutiveFailures, MAX_CONSECUTIVE_FAILURES);
-      
-      // 連続失敗回数が閾値を超えた場合、モデムをリセット
-      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-        SerialMon.println("Too many consecutive failures, resetting modem...");
-        resetModem();
-      }
+    // 連続失敗回数が閾値を超えた場合、モデムをリセット
+    if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+      SerialMon.println("Too many consecutive failures, resetting modem...");
+      resetModem();
     }
+  }
 
-    M5.Lcd.clear(BLACK);
-    M5.Lcd.setCursor(0, 0);
-    M5.Lcd.setTextFont(4);
-    M5.Lcd.println("UNIT CO2 (SCD40)");
+  // LCD表示の更新
+  M5.Lcd.clear(BLACK);
+  M5.Lcd.setCursor(0, 0);
+  M5.Lcd.setTextFont(4);
+  M5.Lcd.println("CO2 + Wind Monitor");
+  
+  if (scd40Success) {
     M5.Lcd.printf("CO2   : %.0f ppm\n", co2);
     M5.Lcd.printf("Temp  : %.2f C\n", temp);
     M5.Lcd.printf("Hum   : %.2f %%\n", humidity);
-    
-    // 通信状態を表示
-    M5.Lcd.setTextFont(2);
-    M5.Lcd.printf("Network: %s\n", sendSuccess ? "OK" : "Error");
-    M5.Lcd.printf("Fails: %d/%d\n", consecutiveFailures, MAX_CONSECUTIVE_FAILURES);
-    M5.Lcd.printf("Interval: %lu sec\n", INTERVAL / 1000); // 送信インターバルを秒単位で表示
-    
-    // IMSIは長いので後半6桁だけ表示
-    String shortImsi = subscriberImsi;
-    if (shortImsi.length() > 6) {
-      shortImsi = "..." + shortImsi.substring(shortImsi.length() - 6);
-    }
-    M5.Lcd.printf("IMSI: %s\n", shortImsi.c_str()); // 回線のIMSI（短縮表示）
-    
-    // 回線名も長い場合は省略
-    String shortName = subscriberName;
-    if (shortName.length() > 10) {
-      shortName = shortName.substring(0, 10) + "...";
-    }
-    M5.Lcd.printf("Name: %s\n", shortName.c_str()); // 回線の名前（短縮表示）
-
-    SerialMon.printf("CO2: %.0f ppm, Temp: %.2f C, Hum: %.2f %%\n", co2, temp, humidity);
   } else {
-    M5.Lcd.clear(BLACK);
-    M5.Lcd.println("SCD40 readMeasurement() failed");
-    SerialMon.println("SCD40 readMeasurement() failed");
+    M5.Lcd.println("SCD40: Error");
+  }
+  
+  if (fs3000Success) {
+    M5.Lcd.printf("Wind  : %.2f m/s\n", windSpeed);
+  } else {
+    M5.Lcd.println("FS3000: Error");
+  }
+  
+  // 通信状態を表示
+  M5.Lcd.setTextFont(2);
+  M5.Lcd.printf("Network: %s\n", sendSuccess ? "OK" : "Error");
+  M5.Lcd.printf("Fails: %d/%d\n", consecutiveFailures, MAX_CONSECUTIVE_FAILURES);
+  M5.Lcd.printf("Interval: %lu sec\n", INTERVAL / 1000); // 送信インターバルを秒単位で表示
+  
+  // IMSIは長いので後半6桁だけ表示
+  String shortImsi = subscriberImsi;
+  if (shortImsi.length() > 6) {
+    shortImsi = "..." + shortImsi.substring(shortImsi.length() - 6);
+  }
+  M5.Lcd.printf("IMSI: %s\n", shortImsi.c_str()); // 回線のIMSI（短縮表示）
+  
+  // 回線名も長い場合は省略
+  String shortName = subscriberName;
+  if (shortName.length() > 10) {
+    shortName = shortName.substring(0, 10) + "...";
+  }
+  M5.Lcd.printf("Name: %s\n", shortName.c_str()); // 回線の名前（短縮表示）
+
+  // シリアル出力の更新
+  if (scd40Success && fs3000Success) {
+    SerialMon.printf("CO2: %.0f ppm, Temp: %.2f C, Hum: %.2f %%, Wind: %.2f m/s\n",
+                    co2, temp, humidity, windSpeed);
+  } else if (scd40Success) {
+    SerialMon.printf("CO2: %.0f ppm, Temp: %.2f C, Hum: %.2f %%, Wind: Error\n",
+                    co2, temp, humidity);
+  } else if (fs3000Success) {
+    SerialMon.printf("CO2: Error, Wind: %.2f m/s\n", windSpeed);
+  } else {
+    SerialMon.println("Both sensors failed to read data");
   }
   
   // 最後の更新時間を記録
@@ -238,6 +279,9 @@ void setup() {
   // --- I2C初期化 (PortAのSDA=21, SCL=22) ---
   Wire.begin(21, 22);
 
+  // --- I2Cデバイススキャン ---
+  scanI2CDevices();
+
   // --- SCD40 (SCD4x) の初期化 ---
   if (!scd40.begin(Wire)) {
     M5.Lcd.setCursor(0, 0);
@@ -248,6 +292,20 @@ void setup() {
     M5.Lcd.clear(BLACK);
     M5.Lcd.println("SCD40 (SCD4x) Setup Complete.");
     SerialMon.println("SCD40 (SCD4x) Setup Complete.");
+  }
+
+  // --- FS3000 空気速度センサーの初期化 ---
+  if (!fs3000.begin(Wire)) {
+    M5.Lcd.setCursor(0, 0);
+    M5.Lcd.println("FS3000 init failed! Check wiring/address = 0x28");
+    SerialMon.println("FS3000 init failed! Check wiring/address = 0x28");
+  } else {
+    M5.Lcd.clear(BLACK);
+    M5.Lcd.println("FS3000 Air Velocity Sensor Setup Complete.");
+    SerialMon.println("FS3000 Air Velocity Sensor Setup Complete.");
+    
+    // デバッグ: センサー情報を表示
+    fs3000.printSensorInfo();
   }
 
   // --- SIM7080の初期化 ---
@@ -713,6 +771,36 @@ void resetModem() {
   // メタデータからインターバル設定と回線情報を取得
   fetchAndUpdateInterval();
   fetchSubscriberInfo();
+}
+
+// I2Cデバイススキャン関数
+void scanI2CDevices() {
+  SerialMon.println("Scanning I2C devices...");
+  byte error, address;
+  int nDevices = 0;
+  
+  for(address = 1; address < 127; address++) {
+    Wire.beginTransmission(address);
+    error = Wire.endTransmission();
+    
+    if (error == 0) {
+      SerialMon.printf("I2C device found at address 0x%02X", address);
+      if (address == 0x28) {
+        SerialMon.print(" (FS3000 Air Velocity Sensor)");
+      } else if (address == 0x62) {
+        SerialMon.print(" (SCD40 CO2 Sensor)");
+      }
+      SerialMon.println();
+      nDevices++;
+    }
+  }
+  
+  if (nDevices == 0) {
+    SerialMon.println("No I2C devices found");
+  } else {
+    SerialMon.printf("Found %d I2C devices\n", nDevices);
+  }
+  SerialMon.println();
 }
 
 void loop() {
