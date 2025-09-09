@@ -41,6 +41,13 @@ const uint16_t udpPort = 23080;         // サーバーのポート番号
 
 TinyGsm modem(SerialAT);
 
+// MQTT設定状態
+bool mqttEnabled = false;
+String mqttTopic = "";
+int mqttQos = 0; // 0 or 1
+bool mqttConnected = false;
+bool mqttConfigValid = false;
+
 // 関数プロトタイプ宣言
 bool checkModemStatus();
 void hardResetModem();
@@ -51,6 +58,79 @@ void resetModem();
 void readAndSendData();
 void scanI2CDevices();
 
+// MQTT関連プロトタイプ
+bool mqttConfigure();
+bool mqttConnect();
+bool mqttPublish(const String& topic, const String& json, int qos);
+void mqttDisconnect();
+bool isMqttOnline();
+bool isValidMqttTopic(const String& topic);
+bool ensurePdp0Active();
+
+// Ensure PDP context #0 is active and has an IP address
+bool ensurePdp0Active() {
+  // Check current PDP context status
+  String pdp = "";
+  modem.sendAT("+CNACT?");
+  modem.waitResponse(5000L, pdp);
+  SerialMon.println("ensurePdp0Active(): current +CNACT?");
+  SerialMon.println(pdp);
+
+  auto hasIp = []() -> bool {
+    IPAddress ip = modem.localIP();
+    return !(ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0);
+  };
+
+  // Already active?
+  if (pdp.indexOf("+CNACT: 0,1") != -1 && hasIp()) {
+    return true;
+  }
+
+  const int maxActTries = 3;
+  const int baseDelay = 1000;
+
+  for (int attempt = 0; attempt < maxActTries; ++attempt) {
+    SerialMon.println("ensurePdp0Active(): activating PDP#0 with AT+CNACT=0,1 ...");
+    modem.sendAT("+CNACT=0,1");
+    int r = modem.waitResponse(20000L);
+    if (r != 1) {
+      SerialMon.println("ensurePdp0Active(): AT+CNACT=0,1 returned error/timeout");
+    }
+
+    // Re-check status
+    pdp = "";
+    modem.sendAT("+CNACT?");
+    modem.waitResponse(5000L, pdp);
+    SerialMon.println("ensurePdp0Active(): +CNACT? after activation attempt:");
+    SerialMon.println(pdp);
+
+    if (pdp.indexOf("+CNACT: 0,1") != -1 && hasIp()) {
+      SerialMon.println("ensurePdp0Active(): PDP#0 active with IP");
+      return true;
+    }
+
+    // As a stronger recovery, after the first failed attempt, try GPRS reconnect
+    if (attempt >= 1) {
+      SerialMon.println("ensurePdp0Active(): trying GPRS reconnect (disconnect -> connect)...");
+      modem.gprsDisconnect();
+      delay(1000);
+      if (!modem.gprsConnect("soracom.io", "sora", "sora")) {
+        SerialMon.println("ensurePdp0Active(): gprsConnect failed");
+      } else {
+        SerialMon.print("ensurePdp0Active(): Local IP after gprsConnect: ");
+        SerialMon.println(modem.localIP());
+      }
+    }
+
+    int jitter = rand() % 1000;
+    int delayTime = baseDelay * (1 << attempt) + jitter;
+    SerialMon.printf("ensurePdp0Active(): retry %d/%d in %d ms\n", attempt + 1, maxActTries, delayTime);
+    delay(delayTime);
+  }
+
+  SerialMon.println("ensurePdp0Active(): failed to activate PDP#0");
+  return false;
+}
 // センサーデータの読み取り、送信、画面更新を行う関数
 void readAndSendData() {
   unsigned long current = millis();
@@ -85,25 +165,53 @@ void readAndSendData() {
   memcpy(payload + 4, &temp, sizeof(temp));
   memcpy(payload + 8, &humidity, sizeof(humidity));
   memcpy(payload + 12, &windSpeed, sizeof(windSpeed));
-  // この場合はバイナリパーサーでパースする必要がある
   // co2::float:32:little-endian Temp::float:32:little-endian Humi::float:32:little-endian Wind::float:32:little-endian
 
-  SerialMon.println("Sending data...");
-  bool sendSuccess = sendDataWithStatus(payload, sizeof(payload));
+  bool sendSuccess = false;
+  SerialMon.println("Preparing to send data...");
+
+  if (mqttEnabled) {
+    if (mqttConfigValid) {
+      // JSONペイロードを生成
+      String json = String("{\"co2\":") + String(co2, 1)
+                  + ",\"temp\":" + String(temp, 1)
+                  + ",\"humi\":" + String(humidity, 1)
+                  + ",\"wind\":" + String(windSpeed, 2) + "}";
+      SerialMon.print("MQTT JSON: ");
+      SerialMon.println(json);
+
+      // 接続確認し、未接続なら接続
+      if (!isMqttOnline()) {
+        SerialMon.println("MQTT not online. Attempting connect...");
+        mqttConnect();
+      }
+      sendSuccess = mqttPublish(mqttTopic, json, mqttQos);
+    } else {
+      SerialMon.println("MQTT config invalid (topic/qos). Skipping send and waiting for metadata update.");
+      // 送信失敗としてカウントしない（仕様）
+      sendSuccess = false;
+    }
+  } else {
+    // UDP送信
+    SerialMon.println("Sending data via UDP...");
+    sendSuccess = sendDataWithStatus(payload, sizeof(payload));
+  }
   
   if (sendSuccess) {
     // 送信成功
     consecutiveFailures = 0; // 失敗カウンターをリセット
     lastSuccessfulSend = current; // 最後の成功送信時間を更新
   } else {
-    // 送信失敗
-    consecutiveFailures++;
-    SerialMon.printf("Consecutive failures: %d/%d\n", consecutiveFailures, MAX_CONSECUTIVE_FAILURES);
-    
-    // 連続失敗回数が閾値を超えた場合、モデムをリセット
-    if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-      SerialMon.println("Too many consecutive failures, resetting modem...");
-      resetModem();
+    // 送信失敗（ただしMQTT設定不正時はカウントしない）
+    if (!(mqttEnabled && !mqttConfigValid)) {
+      consecutiveFailures++;
+      SerialMon.printf("Consecutive failures: %d/%d\n", consecutiveFailures, MAX_CONSECUTIVE_FAILURES);
+      
+      // 連続失敗回数が閾値を超えた場合、モデムをリセット
+      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+        SerialMon.println("Too many consecutive failures, resetting modem...");
+        resetModem();
+      }
     }
   }
 
@@ -129,6 +237,15 @@ void readAndSendData() {
   
   // 通信状態を表示
   M5.Lcd.setTextFont(2);
+  if (mqttEnabled) {
+    if (mqttConfigValid) {
+      M5.Lcd.printf("Mode   : MQTT qos=%d\n", mqttQos);
+    } else {
+      M5.Lcd.println("Mode   : MQTT CONFIG ERR");
+    }
+  } else {
+    M5.Lcd.println("Mode   : UDP");
+  }
   M5.Lcd.printf("Network: %s\n", sendSuccess ? "OK" : "Error");
   M5.Lcd.printf("Fails: %d/%d\n", consecutiveFailures, MAX_CONSECUTIVE_FAILURES);
   M5.Lcd.printf("Interval: %lu sec\n", INTERVAL / 1000); // 送信インターバルを秒単位で表示
@@ -166,7 +283,7 @@ void readAndSendData() {
 
 // SORACOMメタデータからインターバル設定を取得する関数
 void fetchAndUpdateInterval() {
-  SerialMon.println("Fetching interval setting from SORACOM metadata...");
+  SerialMon.println("Fetching interval/MQTT settings from SORACOM metadata...");
   
   // HTTPクライアントの初期化
   TinyGsmClient client(modem);
@@ -191,8 +308,8 @@ void fetchAndUpdateInterval() {
   String response = http.responseBody();
   SerialMon.println("Response: " + response);
   
-  // JSONデータのパース
-  DynamicJsonDocument doc(256);
+  // JSONデータのパース（MQTTキー追加に備えサイズ拡張）
+  DynamicJsonDocument doc(512);
   DeserializationError error = deserializeJson(doc, response);
   if (error) {
     SerialMon.print("JSON parsing failed: ");
@@ -212,6 +329,61 @@ void fetchAndUpdateInterval() {
   } else {
     SerialMon.println("interval_s not found in metadata");
   }
+
+  // MQTT設定の取得と検証
+  bool prevMqttEnabled = mqttEnabled;
+  bool newMqttEnabled = false;
+  String newTopic = "";
+  int newQos = 0;
+  bool newConfigValid = false;
+
+  if (doc.containsKey("mqtt")) {
+    newMqttEnabled = doc["mqtt"].as<bool>();
+  }
+
+  if (newMqttEnabled) {
+    if (doc.containsKey("topic")) {
+      newTopic = doc["topic"].as<String>();
+    }
+    if (doc.containsKey("qos")) {
+      newQos = doc["qos"].as<int>();
+    }
+
+    // バリデーション: topic非空・可視ASCII（長さ1-256程度）/ qosは0または1
+    auto isPrintableAscii = [](char c) {
+      return c >= 32 && c <= 126;
+    };
+    bool topicOk = newTopic.length() > 0 && newTopic.length() <= 256;
+    if (topicOk) {
+      for (size_t i = 0; i < newTopic.length(); ++i) {
+        if (!isPrintableAscii(newTopic[i])) { topicOk = false; break; }
+      }
+    }
+    bool qosOk = (newQos == 0 || newQos == 1);
+
+    newConfigValid = topicOk && qosOk;
+
+    if (!newConfigValid) {
+      SerialMon.println("MQTT config invalid in metadata (topic/qos). MQTT send will be disabled until corrected.");
+    }
+  }
+
+  // 切替時の処理（MQTT→UDP）
+  if (prevMqttEnabled && !newMqttEnabled) {
+    SerialMon.println("MQTT disabled by metadata. Disconnecting MQTT session immediately.");
+    mqttDisconnect();
+  }
+
+  mqttEnabled = newMqttEnabled;
+  mqttTopic = newTopic;
+  mqttQos = newQos;
+  mqttConfigValid = newMqttEnabled ? newConfigValid : false;
+
+  SerialMon.printf("MQTT enabled: %s, topic: %s, qos: %d, valid: %s\n",
+                   mqttEnabled ? "true" : "false",
+                   mqttTopic.c_str(),
+                   mqttQos,
+                   mqttConfigValid ? "true" : "false");
 }
 
 // 回線情報を取得する関数
@@ -383,67 +555,77 @@ void setup() {
   fetchAndUpdateInterval();
   fetchSubscriberInfo();
 
-  // UDPソケットの初期化（リトライ処理付き）
-  int socketRetries = 3;
-  int socketBaseDelay = 1000;
-  bool socketOpened = false;
-  
-  for (int attempt = 0; attempt < socketRetries; attempt++) {
-    // UDPソケットをクローズ
-    SerialMon.println("Closing any existing UDP socket...");
-    modem.sendAT("+CACLOSE=0");
-    modem.waitResponse(10000L);
+  if (mqttEnabled && mqttConfigValid) {
+    SerialMon.println("MQTT mode enabled by metadata. Configuring MQTT...");
+    if (!mqttConfigure()) {
+      SerialMon.println("MQTT configure failed. Will attempt again before publish.");
+    }
+    if (!mqttConnect()) {
+      SerialMon.println("MQTT connect failed. Will retry automatically before publish.");
+    }
+  } else {
+    // UDPソケットの初期化（リトライ処理付き）
+    int socketRetries = 3;
+    int socketBaseDelay = 1000;
+    bool socketOpened = false;
     
-    // モデムの状態確認
-    String cgattStatus = "";
-    modem.sendAT("+CGATT?");
-    if (modem.waitResponse(5000L, cgattStatus) == 1) {
-      SerialMon.print("Network attachment status: ");
-      SerialMon.println(cgattStatus);
+    for (int attempt = 0; attempt < socketRetries; attempt++) {
+      // UDPソケットをクローズ
+      SerialMon.println("Closing any existing UDP socket...");
+      modem.sendAT("+CACLOSE=0");
+      modem.waitResponse(10000L);
       
-      if (cgattStatus.indexOf("+CGATT: 1") == -1) {
-        SerialMon.println("Modem not attached to network, reconnecting...");
-        modem.gprsConnect("soracom.io", "sora", "sora");
-        delay(2000);
+      // モデムの状態確認
+      String cgattStatus = "";
+      modem.sendAT("+CGATT?");
+      if (modem.waitResponse(5000L, cgattStatus) == 1) {
+        SerialMon.print("Network attachment status: ");
+        SerialMon.println(cgattStatus);
+        
+        if (cgattStatus.indexOf("+CGATT: 1") == -1) {
+          SerialMon.println("Modem not attached to network, reconnecting...");
+          modem.gprsConnect("soracom.io", "sora", "sora");
+          delay(2000);
+        }
+      }
+
+      // UDPソケットを開く（ATコマンド使用）
+      SerialMon.println("Opening UDP socket...");
+      // ATコマンド送信
+      modem.sendAT("+CAOPEN=0,0,\"UDP\",\"" + String(udpServer) + "\"," + String(udpPort));
+
+      // レスポンスを取得して詳細を表示
+      String atResponse = "";
+      int response = modem.waitResponse(15000L, atResponse); // タイムアウトを15秒に延長
+
+      if (response == 1) {
+        SerialMon.println("UDP socket opened successfully!");
+        socketOpened = true;
+        break; // 成功したのでループを抜ける
+      } else {
+        SerialMon.println("Failed to open UDP socket. AT Response:");
+        SerialMon.println(atResponse);
+        
+        // バッファをクリア
+        while (SerialAT.available()) {
+          SerialAT.read();
+        }
+        
+        if (attempt < socketRetries - 1) {
+          // 指数バックオフ + ジッター戦略
+          int jitter = rand() % 1000;
+          int delayTime = socketBaseDelay * (1 << attempt) + jitter;
+          SerialMon.printf("Retry %d/%d, waiting for %d ms\n", attempt + 1, socketRetries, delayTime);
+          delay(delayTime);
+        }
       }
     }
-
-    // UDPソケットを開く（ATコマンド使用）
-    SerialMon.println("Opening UDP socket...");
-    // ATコマンド送信
-    modem.sendAT("+CAOPEN=0,0,\"UDP\",\"" + String(udpServer) + "\"," + String(udpPort));
-
-    // レスポンスを取得して詳細を表示
-    String atResponse = "";
-    int response = modem.waitResponse(15000L, atResponse); // タイムアウトを15秒に延長
-
-    if (response == 1) {
-      SerialMon.println("UDP socket opened successfully!");
-      socketOpened = true;
-      break; // 成功したのでループを抜ける
-    } else {
-      SerialMon.println("Failed to open UDP socket. AT Response:");
-      SerialMon.println(atResponse);
-      
-      // バッファをクリア
-      while (SerialAT.available()) {
-        SerialAT.read();
-      }
-      
-      if (attempt < socketRetries - 1) {
-        // 指数バックオフ + ジッター戦略
-        int jitter = rand() % 1000;
-        int delayTime = socketBaseDelay * (1 << attempt) + jitter;
-        SerialMon.printf("Retry %d/%d, waiting for %d ms\n", attempt + 1, socketRetries, delayTime);
-        delay(delayTime);
-      }
+    
+    if (!socketOpened) {
+      SerialMon.println("Failed to open UDP socket after maximum retries. Restarting...");
+      delay(1000);
+      ESP.restart(); // 再起動
     }
-  }
-  
-  if (!socketOpened) {
-    SerialMon.println("Failed to open UDP socket after maximum retries. Restarting...");
-    delay(1000);
-    ESP.restart(); // 再起動
   }
   
   // setup完了後、すぐに初回のデータ送信と画面更新を行う
@@ -488,7 +670,9 @@ bool checkModemStatus() {
   if (modem.waitResponse(5000L, pdpStatus) == 1) {
     SerialMon.print("PDP context status: ");
     SerialMon.println(pdpStatus);
-    if (pdpStatus.indexOf("+CNACT: 1,1") == -1) {
+    bool pdp0Active = pdpStatus.indexOf("+CNACT: 0,1") != -1;
+    bool pdp1Active = pdpStatus.indexOf("+CNACT: 1,1") != -1;
+    if (!pdp0Active && !pdp1Active) {
       SerialMon.println("PDP context not active");
       return false;
     }
@@ -735,10 +919,13 @@ void resetModem() {
   modem.gprsDisconnect();
   delay(1000);
   
-  // UDPソケットをクローズ
+  // UDPソケットをクローズ（UDPモード時のみ有効だが、冪等に実行）
   modem.sendAT("+CACLOSE=0");
   modem.waitResponse(5000L);
   
+  // MQTTセッションがあるなら明示的に切断（保険）
+  mqttDisconnect();
+
   // モデムをソフトリセット
   modem.restart();
   delay(3000);
@@ -757,20 +944,29 @@ void resetModem() {
     hardResetModem();
     return;
   }
+
+  // 最新メタデータを取得（モード/トピック/qosの更新を反映）
+  fetchAndUpdateInterval();
+  fetchSubscriberInfo();
   
-  // UDPソケットを再度開く
-  if (!openUdpSocket()) {
-    SerialMon.println("Failed to reopen UDP socket after reset, restarting device");
-    ESP.restart();
-    return;
+  if (mqttEnabled && mqttConfigValid) {
+    SerialMon.println("Reconfiguring MQTT after modem reset...");
+    if (!mqttConfigure()) {
+      SerialMon.println("MQTT configure failed after reset");
+    } else if (!mqttConnect()) {
+      SerialMon.println("MQTT connect failed after reset");
+    }
+  } else {
+    // UDPソケットを再度開く
+    if (!openUdpSocket()) {
+      SerialMon.println("Failed to reopen UDP socket after reset, restarting device");
+      ESP.restart();
+      return;
+    }
   }
   
   SerialMon.println("Modem reset and reconnected successfully");
   consecutiveFailures = 0; // 失敗カウンターをリセット
-  
-  // メタデータからインターバル設定と回線情報を取得
-  fetchAndUpdateInterval();
-  fetchSubscriberInfo();
 }
 
 // I2Cデバイススキャン関数
@@ -819,4 +1015,236 @@ void loop() {
   }
 
   M5.update();
+}
+// ==== MQTT helper implementations (SIM7080 AT commands) ====
+
+// MQTT URL設定のフォールバック実装
+static bool mqttConfUrlWithFallback() {
+  // 1) 推奨: URL と ポートを分けて設定
+  modem.sendAT("+SMCONF=\"URL\",\"beam.soracom.io\",1883");
+  if (modem.waitResponse(5000L) == 1) {
+    return true;
+  }
+  SerialMon.println("SMCONF URL with separate port failed, trying single-arg fallback...");
+
+  // 2) 一部FW向け: "beam.soracom.io,1883" を単一引数として渡す
+  modem.sendAT("+SMCONF=\"URL\",\"beam.soracom.io,1883\"");
+  if (modem.waitResponse(5000L) == 1) {
+    return true;
+  }
+  SerialMon.println("SMCONF URL fallback also failed");
+  return false;
+}
+
+bool isValidMqttTopic(const String& topic) {
+  if (topic.length() == 0 || topic.length() > 256) return false;
+  for (size_t i = 0; i < topic.length(); ++i) {
+    char c = topic[i];
+    if (c < 32 || c > 126) return false; // 可視ASCIIのみ
+  }
+  return true;
+}
+
+bool mqttConfigure() {
+  bool ok = true;
+
+  // URL
+  if (!mqttConfUrlWithFallback()) ok = false;
+  // Force MQTT to use PDP context ID 0
+  modem.sendAT("+SMCONF=\"CONNID\",0");
+  if (modem.waitResponse(5000L) != 1) { SerialMon.println("SMCONF CONNID failed"); ok = false; }
+
+  // CLIENTID = IMSI（取得済み想定。空なら代替でIMEI）
+  String clientId = subscriberImsi;
+  if (clientId.length() == 0 || clientId == "Unknown") {
+    clientId = modem.getIMEI();
+  }
+  modem.sendAT("+SMCONF=\"CLIENTID\",\"" + clientId + "\"");
+  if (modem.waitResponse(5000L) != 1) { SerialMon.println("SMCONF CLIENTID failed"); ok = false; }
+
+  // セッション/キープ/同期モード
+  modem.sendAT("+SMCONF=\"CLEANSS\",1");
+  if (modem.waitResponse(5000L) != 1) { SerialMon.println("SMCONF CLEANSS failed"); ok = false; }
+  modem.sendAT("+SMCONF=\"KEEPTIME\",60");
+  if (modem.waitResponse(5000L) != 1) { SerialMon.println("SMCONF KEEPTIME failed"); ok = false; }
+  modem.sendAT("+SMCONF=\"ASYNCMODE\",0");
+  if (modem.waitResponse(5000L) != 1) { SerialMon.println("SMCONF ASYNCMODE failed"); ok = false; }
+
+  // 認証なし
+  modem.sendAT("+SMCONF=\"USERNAME\",\"\"");
+  if (modem.waitResponse(5000L) != 1) { SerialMon.println("SMCONF USERNAME failed"); ok = false; }
+  modem.sendAT("+SMCONF=\"PASSWORD\",\"\"");
+  if (modem.waitResponse(5000L) != 1) { SerialMon.println("SMCONF PASSWORD failed"); ok = false; }
+
+  // 既定QOSの設定（実送信はSMPUBの引数も使用）
+  modem.sendAT("+SMCONF=\"QOS\"," + String(mqttQos));
+  if (modem.waitResponse(5000L) != 1) { SerialMon.println("SMCONF QOS failed"); ok = false; }
+
+  return ok;
+}
+
+bool isMqttOnline() {
+  String resp = "";
+  modem.sendAT("+SMSTATE?");
+  if (modem.waitResponse(5000L, resp) != 1) {
+    mqttConnected = false;
+    return false;
+  }
+  // +SMSTATE: <status>  1 or 2 でオンライン
+  if (resp.indexOf("+SMSTATE: 1") != -1 || resp.indexOf("+SMSTATE: 2") != -1) {
+    mqttConnected = true;
+    return true;
+  }
+  mqttConnected = false;
+  return false;
+}
+
+bool mqttConnect() {
+  const int maxRetries = 3;
+  const int baseDelay = 1000;
+
+  for (int attempt = 0; attempt < maxRetries; ++attempt) {
+    // 既にオンラインなら成功
+    if (isMqttOnline()) return true;
+
+    // PDP#0 が非アクティブなら再活性化を試行
+    if (!ensurePdp0Active()) {
+      int jitter = rand() % 1000;
+      int delayTime = baseDelay * (1 << attempt) + jitter;
+      SerialMon.printf("PDP#0 activation failed, retry %d/%d after %d ms\n", attempt + 1, maxRetries, delayTime);
+      delay(delayTime);
+      continue;
+    }
+
+    // 接続前の診断ログ: PDP と MQTT 状態
+    {
+      String pdp = "";
+      modem.sendAT("+CNACT?");
+      modem.waitResponse(5000L, pdp);
+      SerialMon.println("PDP status before SMCONN:");
+      SerialMon.println(pdp);
+
+      String stBefore = "";
+      modem.sendAT("+SMSTATE?");
+      modem.waitResponse(5000L, stBefore);
+      SerialMon.println("SMSTATE before SMCONN:");
+      SerialMon.println(stBefore);
+    }
+
+    SerialMon.println("MQTT connecting (AT+SMCONN)...");
+    modem.sendAT("+SMCONN");
+    if (modem.waitResponse(60000L) == 1) {
+      // 接続後の状態を確認
+      String stAfter = "";
+      modem.sendAT("+SMSTATE?");
+      modem.waitResponse(5000L, stAfter);
+      SerialMon.println("SMSTATE after SMCONN:");
+      SerialMon.println(stAfter);
+
+      if (isMqttOnline()) {
+        SerialMon.println("MQTT connected");
+        return true;
+      }
+    }
+
+    // リトライ待機（指数バックオフ + ジッター）
+    int jitter = rand() % 1000;
+    int delayTime = baseDelay * (1 << attempt) + jitter;
+    SerialMon.printf("MQTT connect retry %d/%d, waiting %d ms\n", attempt + 1, maxRetries, delayTime);
+    delay(delayTime);
+  }
+
+  // 既定回数失敗時のフォールバック: MQTTスタック再初期化
+  SerialMon.println("MQTT connect failed after retries - resetting MQTT stack (SMDISC + SMCONF reapply)");
+  mqttDisconnect();
+  // 再度SMCONF一式を適用（失敗しても続行）
+  if (!mqttConfigure()) {
+    SerialMon.println("Reapply SMCONF returned error, proceeding anyway");
+  }
+
+  // PDP#0を再確認・再活性化
+  if (!ensurePdp0Active()) {
+    SerialMon.println("PDP#0 still inactive after reconfigure");
+    return false;
+  }
+
+  // 最終接続試行（1ラウンド）
+  {
+    String pdp = "";
+    modem.sendAT("+CNACT?");
+    modem.waitResponse(5000L, pdp);
+    SerialMon.println("PDP status before SMCONN (final):");
+    SerialMon.println(pdp);
+
+    String stBefore = "";
+    modem.sendAT("+SMSTATE?");
+    modem.waitResponse(5000L, stBefore);
+    SerialMon.println("SMSTATE before SMCONN (final):");
+    SerialMon.println(stBefore);
+  }
+
+  SerialMon.println("MQTT connecting (AT+SMCONN) final attempt...");
+  modem.sendAT("+SMCONN");
+  if (modem.waitResponse(60000L) == 1) {
+    String stAfter = "";
+    modem.sendAT("+SMSTATE?");
+    modem.waitResponse(5000L, stAfter);
+    SerialMon.println("SMSTATE after SMCONN (final):");
+    SerialMon.println(stAfter);
+
+    if (isMqttOnline()) {
+      SerialMon.println("MQTT connected (after stack reset)");
+      return true;
+    }
+  }
+
+  SerialMon.println("MQTT connect failed after stack reset");
+  return false;
+}
+
+void mqttDisconnect() {
+  SerialMon.println("MQTT disconnecting (AT+SMDISC)...");
+  modem.sendAT("+SMDISC");
+  modem.waitResponse(10000L);
+  mqttConnected = false;
+}
+
+bool mqttPublish(const String& topic, const String& json, int qos) {
+  if (!mqttEnabled || !mqttConfigValid) {
+    SerialMon.println("MQTT publish skipped: MQTT disabled or config invalid");
+    return false;
+  }
+
+  if (!isValidMqttTopic(topic)) {
+    SerialMon.println("MQTT publish skipped: topic invalid");
+    return false;
+  }
+
+  if (!isMqttOnline()) {
+    SerialMon.println("MQTT not online, trying to reconnect...");
+    if (!mqttConnect()) {
+      SerialMon.println("MQTT reconnect failed, cannot publish");
+      return false;
+    }
+  }
+
+  int length = json.length();
+  SerialMon.printf("Publishing via MQTT: topic=%s len=%d qos=%d\n", topic.c_str(), length, qos);
+
+  modem.sendAT("+SMPUB=\"" + topic + "\"," + String(length) + "," + String(qos) + ",0");
+  if (modem.waitResponse(">") != 1) {
+    SerialMon.println("SMPUB prompt not received");
+    return false;
+  }
+
+  // 本文送出
+  SerialAT.print(json);
+
+  if (modem.waitResponse(10000L) != 1) {
+    SerialMon.println("SMPUB publish failed");
+    return false;
+  }
+
+  SerialMon.println("SMPUB OK");
+  return true;
 }
