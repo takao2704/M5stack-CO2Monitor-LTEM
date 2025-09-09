@@ -50,7 +50,7 @@ graph TD
     style F fill:#bfb,stroke:#333,stroke-width:2px
     style G fill:#fbb,stroke:#333,stroke-width:2px
     style I fill:#fbf,stroke:#333,stroke-width:2px
-    linkStyle default stroke:#455A64,stroke-width:2px,color:#111111;
+    
 ```
 
 ## 必要なハードウェア
@@ -105,7 +105,7 @@ graph LR
     style E fill:#bbf,stroke:#333,stroke-width:2px
     style F fill:#bbf,stroke:#333,stroke-width:2px
     style G fill:#bbf,stroke:#333,stroke-width:2px
-    linkStyle default stroke:#455A64,stroke-width:2px,color:#111111;
+    
 ```
 
 ## 必要なソフトウェア・ライブラリ
