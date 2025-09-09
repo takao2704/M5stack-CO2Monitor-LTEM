@@ -563,7 +563,7 @@ void setup() {
     if (!mqttConnect()) {
       SerialMon.println("MQTT connect failed. Will retry automatically before publish.");
     }
-  } else {
+  } else if (!mqttEnabled) {
     // UDPソケットの初期化（リトライ処理付き）
     int socketRetries = 3;
     int socketBaseDelay = 1000;
@@ -626,6 +626,8 @@ void setup() {
       delay(1000);
       ESP.restart(); // 再起動
     }
+  } else {
+    SerialMon.println("MQTT enabled but config invalid; not opening UDP. Waiting for metadata correction...");
   }
   
   // setup完了後、すぐに初回のデータ送信と画面更新を行う
@@ -956,13 +958,15 @@ void resetModem() {
     } else if (!mqttConnect()) {
       SerialMon.println("MQTT connect failed after reset");
     }
-  } else {
+  } else if (!mqttEnabled) {
     // UDPソケットを再度開く
     if (!openUdpSocket()) {
       SerialMon.println("Failed to reopen UDP socket after reset, restarting device");
       ESP.restart();
       return;
     }
+  } else {
+    SerialMon.println("MQTT enabled but config invalid; not opening UDP after reset. Waiting for metadata correction...");
   }
   
   SerialMon.println("Modem reset and reconnected successfully");
@@ -1090,13 +1094,17 @@ bool isMqttOnline() {
     mqttConnected = false;
     return false;
   }
-  // +SMSTATE: <status>  1 or 2 でオンライン
-  if (resp.indexOf("+SMSTATE: 1") != -1 || resp.indexOf("+SMSTATE: 2") != -1) {
-    mqttConnected = true;
-    return true;
+  bool online = (resp.indexOf("+SMSTATE: 1") != -1 || resp.indexOf("+SMSTATE: 2") != -1);
+  if (!online) {
+    // 瞬断対策: 短い待機後に再確認して二重でオフラインなら確定
+    delay(150);
+    resp = "";
+    modem.sendAT("+SMSTATE?");
+    modem.waitResponse(5000L, resp);
+    online = (resp.indexOf("+SMSTATE: 1") != -1 || resp.indexOf("+SMSTATE: 2") != -1);
   }
-  mqttConnected = false;
-  return false;
+  mqttConnected = online;
+  return online;
 }
 
 bool mqttConnect() {
@@ -1246,5 +1254,12 @@ bool mqttPublish(const String& topic, const String& json, int qos) {
   }
 
   SerialMon.println("SMPUB OK");
+  {
+    String stAfterPub = "";
+    modem.sendAT("+SMSTATE?");
+    modem.waitResponse(5000L, stAfterPub);
+    SerialMon.println("SMSTATE after publish:");
+    SerialMon.println(stAfterPub);
+  }
   return true;
 }

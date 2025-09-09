@@ -20,6 +20,17 @@
 ## システム構成図
 
 ```mermaid
+%%{init: {'theme':'base', 'themeVariables': {
+  'primaryColor':'#1565C0', 'primaryTextColor':'#ffffff', 'primaryBorderColor':'#0D47A1',
+  'secondaryColor':'#2E7D32', 'secondaryTextColor':'#ffffff',
+  'tertiaryColor':'#F5F5F5', 'lineColor':'#37474F', 'textColor':'#212121',
+  'fontSize':'14px', 'fontFamily':'Inter, Roboto, Helvetica, Arial',
+  'clusterBkg':'#ECEFF1', 'clusterBorder':'#607D8B',
+  'edgeLabelBackground':'#FFF59D',
+  'error':'#C62828', 'errorTextColor':'#ffffff',
+  'warning':'#EF6C00', 'warningTextColor':'#ffffff',
+  'success':'#2E7D32', 'successTextColor':'#ffffff'
+}}}%%
 graph TD
     A[M5Stack Core] -->|I2C 0x62| B[SCD40 CO2センサー]
     A -->|I2C 0x28| H[FS3000 風速センサー]
@@ -39,6 +50,7 @@ graph TD
     style F fill:#bfb,stroke:#333,stroke-width:2px
     style G fill:#fbb,stroke:#333,stroke-width:2px
     style I fill:#fbf,stroke:#333,stroke-width:2px
+    linkStyle default stroke:#455A64,stroke-width:2px,color:#111111;
 ```
 
 ## 必要なハードウェア
@@ -53,6 +65,17 @@ graph TD
 ## ハードウェア接続図
 
 ```mermaid
+%%{init: {'theme':'base', 'themeVariables': {
+  'primaryColor':'#1565C0', 'primaryTextColor':'#ffffff', 'primaryBorderColor':'#0D47A1',
+  'secondaryColor':'#2E7D32', 'secondaryTextColor':'#ffffff',
+  'tertiaryColor':'#F5F5F5', 'lineColor':'#37474F', 'textColor':'#212121',
+  'fontSize':'14px', 'fontFamily':'Inter, Roboto, Helvetica, Arial',
+  'clusterBkg':'#ECEFF1', 'clusterBorder':'#607D8B',
+  'edgeLabelBackground':'#FFF59D',
+  'error':'#C62828', 'errorTextColor':'#ffffff',
+  'warning':'#EF6C00', 'warningTextColor':'#ffffff',
+  'success':'#2E7D32', 'successTextColor':'#ffffff'
+}}}%%
 graph LR
     subgraph "M5Stack Core"
         A[ポートA] -->|I2C| B[ピン21:SDA<br>ピン22:SCL]
@@ -82,6 +105,7 @@ graph LR
     style E fill:#bbf,stroke:#333,stroke-width:2px
     style F fill:#bbf,stroke:#333,stroke-width:2px
     style G fill:#bbf,stroke:#333,stroke-width:2px
+    linkStyle default stroke:#455A64,stroke-width:2px,color:#111111;
 ```
 
 ## 必要なソフトウェア・ライブラリ
@@ -173,6 +197,38 @@ graph LR
    - 「SORACOM Beam」または「SORACOM Funnel」を有効化
    - 転送先のクラウドサービス情報を設定
 
+## MQTTオプション送信
+
+- 概要:
+  - メタデータで mqtt が true の場合、MQTTのみでpublishします。UDPフォールバックは行いません。
+- ブローカー:
+  - beam.soracom.io:1883（平文）
+- メタデータ仕様:
+  - mqtt: boolean（trueでMQTT有効）
+  - topic: string（可視ASCII, 長さ1–256。リテラル使用。テンプレート展開は未サポート）
+  - qos: 0 または 1
+  - 例:
+    ```json
+    {
+      "interval_s": 5,
+      "mqtt": true,
+      "topic": "sensors/room1",
+      "qos": 1
+    }
+    ```
+- ペイロード（JSON）:
+  - 例: {"co2": 612.3, "temp": 26.1, "humi": 54.2, "wind": 0.72}
+  - 表記上は小数点以下1〜2桁程度。メッセージ長に合わせて送信。
+- 動作/切替:
+  - 起動/復旧後にメタデータを取得し、mqtt=true ならMQTT経路へ。false/未設定ならUDP経路を使用します。
+  - MQTT→UDPに切り替わった際は、即時に SMDISC を送出してMQTT切断します。
+- 再接続/復旧ポリシー（要点）:
+  - PDP#0（+CNACT: 0,1）が非活性の場合、AT+CNACT=0,1 を指数バックオフで試行。必要に応じて gprsDisconnect→gprsConnect を実施し、IP付与を確認します。
+  - SMCONNが連続失敗した場合、SMDISC→SMCONF（URL/CLIENTID/CLEANSS/KEEPTIME/ASYNCMODE/USERNAME/PASSWORD/QOS）を再適用してから最終試行します。
+- 制約/注意:
+  - テンプレート展開は未サポート（例: topicに「{{imsi}}」を入れると、そのままの文字列が使用されます）。
+  - セキュリティ: 平文MQTT（TLS未対応）。
+
 ## データフォーマット
 
 デバイスはUDPでバイナリデータを送信します。データ形式は以下の通りです：
@@ -188,6 +244,14 @@ graph LR
 co2::float:32:little-endian Temp::float:32:little-endian Humi::float:32:little-endian Wind::float:32:little-endian
 ```
 
+### MQTT（JSON）
+
+- 送信ペイロードはJSON形式です（例）:
+  ```json
+  {"co2": 612.3, "temp": 26.1, "humi": 54.2, "wind": 0.72}
+  ```
+- 数値は小数点以下1〜2桁程度で表記します（実装はメッセージ長に合わせて送信）。
+ 
 ## 表示画面
 
 ### LCD表示例
