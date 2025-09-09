@@ -26,7 +26,7 @@
   'tertiaryColor':'#F5F5F5', 'lineColor':'#37474F', 'textColor':'#212121',
   'fontSize':'14px', 'fontFamily':'Inter, Roboto, Helvetica, Arial',
   'clusterBkg':'#ECEFF1', 'clusterBorder':'#607D8B',
-  'edgeLabelBackground':'#FFF59D',
+  'edgeLabelBackground':'#F9A825',
   'error':'#C62828', 'errorTextColor':'#ffffff',
   'warning':'#EF6C00', 'warningTextColor':'#ffffff',
   'success':'#2E7D32', 'successTextColor':'#ffffff'
@@ -45,9 +45,9 @@ graph TD
     style B fill:#bbf,stroke:#333,stroke-width:2px
     style H fill:#bbf,stroke:#333,stroke-width:2px
     style C fill:#bbf,stroke:#333,stroke-width:2px
-    style D fill:#bfb,stroke:#333,stroke-width:2px
-    style E fill:#bfb,stroke:#333,stroke-width:2px
-    style F fill:#bfb,stroke:#333,stroke-width:2px
+    style D fill:#2E7D32,stroke:#1B5E20,stroke-width:2px,color:#ffffff
+    style E fill:#2E7D32,stroke:#1B5E20,stroke-width:2px,color:#ffffff
+    style F fill:#2E7D32,stroke:#1B5E20,stroke-width:2px,color:#ffffff
     style G fill:#fbb,stroke:#333,stroke-width:2px
     style I fill:#fbf,stroke:#333,stroke-width:2px
     
@@ -71,7 +71,7 @@ graph TD
   'tertiaryColor':'#F5F5F5', 'lineColor':'#37474F', 'textColor':'#212121',
   'fontSize':'14px', 'fontFamily':'Inter, Roboto, Helvetica, Arial',
   'clusterBkg':'#ECEFF1', 'clusterBorder':'#607D8B',
-  'edgeLabelBackground':'#FFF59D',
+  'edgeLabelBackground':'#F9A825',
   'error':'#C62828', 'errorTextColor':'#ffffff',
   'warning':'#EF6C00', 'warningTextColor':'#ffffff',
   'success':'#2E7D32', 'successTextColor':'#ffffff'
