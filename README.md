@@ -205,14 +205,25 @@ graph LR
   - beam.soracom.io:1883（平文）
 - メタデータ仕様:
   - mqtt: boolean（trueでMQTT有効）
-  - topic: string（可視ASCII, 長さ1–256。リテラル使用。テンプレート展開は未サポート）
+  - topic: string または 特別値 "azure_default"
+    - string: 可視ASCII, 長さ1–256。リテラル使用（テンプレート展開は未サポート）
+    - "azure_default": デバイス側で Azure IoT Hub 既定のイベントトピックに自動展開（devices/{clientId}/messages/events/）。{clientId} は [cpp.mqttConfigure()](src/main.cpp:1090) で設定された ClientID と一致させます。
   - qos: 0 または 1
-  - 例:
+  - 例（任意ブローカー向けの手動トピック指定）:
     ```json
     {
       "interval_s": 5,
       "mqtt": true,
       "topic": "sensors/room1",
+      "qos": 1
+    }
+    ```
+  - 例（Azure IoT Hub へ送る場合の簡易指定）:
+    ```json
+    {
+      "interval_s": 5,
+      "mqtt": true,
+      "topic": "azure_default",
       "qos": 1
     }
     ```
@@ -227,6 +238,8 @@ graph LR
   - SMCONNが連続失敗した場合、SMDISC→SMCONF（URL/CLIENTID/CLEANSS/KEEPTIME/ASYNCMODE/USERNAME/PASSWORD/QOS）を再適用してから最終試行します。
 - 制約/注意:
   - テンプレート展開は未サポート（例: topicに「{{imsi}}」を入れると、そのままの文字列が使用されます）。
+  - "azure_default" は特別マッピングのみを行い、それ以外の任意トピックの自動変換は行いません（SORACOM Beam がトピックを変換しない前提）。
+  - IoT Hub 直結要件（参考）：IoT Hub に直接 MQTT で接続する場合、トピックは devices/{deviceId}/messages/events/ 固定、USERNAME/PASSWORD は SAS トークンが必要です。本ファームウェアは平文MQTTで Beam 経由を前提としており TLS/SAS の生成はしません。
   - セキュリティ: 平文MQTT（TLS未対応）。
 
 ## データフォーマット

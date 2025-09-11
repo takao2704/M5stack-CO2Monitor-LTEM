@@ -1,0 +1,2 @@
+#!/bin/bash
+exec /opt/homebrew/Cellar/azure-cli/2.75.0/libexec/bin/cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 "$@"

@@ -48,6 +48,14 @@ int mqttQos = 0; // 0 or 1
 bool mqttConnected = false;
 bool mqttConfigValid = false;
 
+// メタデータから指定可能な MQTT ClientID 候補（未指定なら空）
+// - clientid: SIMタグ名を指定し、その値を採用（推奨）
+// - client_id / clientId: 直接 clientId 文字列（後方互換）
+String mqttClientId = "";
+bool mqttClientIdFromMetadata = false;
+String mqttClientIdTagKey = "";
+bool mqttClientIdIsFromTagKey = false;
+
 // 関数プロトタイプ宣言
 bool checkModemStatus();
 void hardResetModem();
@@ -66,6 +74,9 @@ void mqttDisconnect();
 bool isMqttOnline();
 bool isValidMqttTopic(const String& topic);
 bool ensurePdp0Active();
+
+// SORACOM subscriber tag fetch helper
+String fetchSubscriberTag(const String& tagKey);
 
 // Ensure PDP context #0 is active and has an IP address
 bool ensurePdp0Active() {
@@ -379,11 +390,18 @@ void fetchAndUpdateInterval() {
   mqttQos = newQos;
   mqttConfigValid = newMqttEnabled ? newConfigValid : false;
 
+  // clientId はメタデータからは取得しない方針
+  mqttClientIdFromMetadata = false;
+  mqttClientIdIsFromTagKey = false;
+  mqttClientIdTagKey = "";
+  mqttClientId = "";
+
   SerialMon.printf("MQTT enabled: %s, topic: %s, qos: %d, valid: %s\n",
                    mqttEnabled ? "true" : "false",
                    mqttTopic.c_str(),
                    mqttQos,
                    mqttConfigValid ? "true" : "false");
+  SerialMon.println("MQTT clientId: metadata is ignored; will use SIM tag 'azure_device_name' → tag 'name' → IMSI → IMEI");
 }
 
 // 回線情報を取得する関数
@@ -434,6 +452,26 @@ void fetchSubscriberInfo() {
   }
 }
 
+  // 任意の subscriber タグ値を取得（存在しない/エラー時は空文字）
+ String fetchSubscriberTag(const String& tagKey) {
+   SerialMon.printf("Fetching subscriber tag: %s\n", tagKey.c_str());
+   TinyGsmClient client(modem);
+   HttpClient http(client, "metadata.soracom.io", 80);
+   String path = "/v1/subscriber.tags." + tagKey;
+   int err = http.get(path.c_str());
+   if (err != 0) {
+     SerialMon.printf("HTTP GET failed for %s (err=%d)\n", path.c_str(), err);
+     return "";
+   }
+   int status = http.responseStatusCode();
+   if (status != 200) {
+     SerialMon.printf("HTTP response error for %s: %d\n", path.c_str(), status);
+     return "";
+   }
+   String value = http.responseBody();
+   value.trim();
+   return value;
+ }
 void setup() {
   // --- M5Stackの初期化 ---
   M5.begin();
@@ -1055,16 +1093,71 @@ bool mqttConfigure() {
   // URL
   if (!mqttConfUrlWithFallback()) ok = false;
   // Force MQTT to use PDP context ID 0
+  // Note: Some SIM7080 firmware variants use CONTEXTID instead of CONNID
   modem.sendAT("+SMCONF=\"CONNID\",0");
-  if (modem.waitResponse(5000L) != 1) { SerialMon.println("SMCONF CONNID failed"); ok = false; }
+  int smconfConnIdResp = modem.waitResponse(5000L);
+  if (smconfConnIdResp != 1) {
+    SerialMon.println("SMCONF CONNID failed, trying CONTEXTID...");
+    modem.sendAT("+SMCONF=\"CONTEXTID\",0");
+    if (modem.waitResponse(5000L) != 1) { SerialMon.println("SMCONF CONTEXTID failed"); ok = false; }
+  }
 
-  // CLIENTID = IMSI（取得済み想定。空なら代替でIMEI）
-  String clientId = subscriberImsi;
+  // CLIENTID 優先順:
+  // 1) メタデータ clientid=タグ名 → そのタグ値（metadata-tag:KEY）
+  //    （後方互換）client_id / clientId のリテラル
+  // 2) SIMタグ name（Azure IoT の deviceId に合わせやすい）
+  // 3) IMSI
+  // 4) IMEI
+  String clientIdSource = "";
+  String clientId = "";
+
+  // 1) SIMタグ azure_device_name があれば最優先で使用
+  String tagAzure = fetchSubscriberTag("azure_device_name");
+  if (tagAzure.length() > 0) {
+    clientId = tagAzure;
+    clientIdSource = "sim-tag:azure_device_name";
+  }
+
+  // 2) なければ SIMタグ name を使用
+  if (clientId.length() == 0) {
+    clientId = subscriberName;
+    if (clientId.length() > 0 && clientId != "Unknown") {
+      clientIdSource = "sim-tag:name";
+    }
+  }
+
+  // 3) それでも空なら IMSI
+  if (clientId.length() == 0 || clientId == "Unknown") {
+    clientId = subscriberImsi;
+    if (clientId.length() > 0 && clientId != "Unknown") {
+      clientIdSource = "imsi";
+    }
+  }
+
+  // 4) 最後の手段として IMEI
   if (clientId.length() == 0 || clientId == "Unknown") {
     clientId = modem.getIMEI();
+    clientIdSource = "imei";
   }
-  modem.sendAT("+SMCONF=\"CLIENTID\",\"" + clientId + "\"");
-  if (modem.waitResponse(5000L) != 1) { SerialMon.println("SMCONF CLIENTID failed"); ok = false; }
+  // 可視ASCIIにサニタイズ（ダブルクオートは除外）
+  String sanitized = "";
+  for (size_t i = 0; i < clientId.length(); ++i) {
+    char c = clientId[i];
+    if (c >= 32 && c <= 126 && c != '\"') sanitized += c;
+  }
+  if (sanitized.length() == 0) {
+    sanitized = modem.getIMEI();
+    clientIdSource = "imei";
+  }
+  modem.sendAT("+SMCONF=\"CLIENTID\",\"" + sanitized + "\"");
+  if (modem.waitResponse(5000L) != 1) {
+    SerialMon.println("SMCONF CLIENTID failed");
+    ok = false;
+  } else {
+    // 保存: 実際に使用するClientID（後続のトピック構築に使用）
+    mqttClientId = sanitized;
+    SerialMon.printf("SMCONF CLIENTID set to: %s (source=%s)\n", sanitized.c_str(), clientIdSource.c_str());
+  }
 
   // セッション/キープ/同期モード
   modem.sendAT("+SMCONF=\"CLEANSS\",1");
@@ -1236,10 +1329,25 @@ bool mqttPublish(const String& topic, const String& json, int qos) {
     }
   }
 
-  int length = json.length();
-  SerialMon.printf("Publishing via MQTT: topic=%s len=%d qos=%d\n", topic.c_str(), length, qos);
+  // トピックの最終決定:
+  // - メタデータで topic == "azure_default" の場合:
+  //   Azure IoT Hub 既定のイベントトピックに置換:
+  //     devices/{clientId}/messages/events/
+  //   ここで clientId は SMCONF で設定したもの（mqttClientId）と一致させる
+  String finalTopic = topic;
+  if (topic.equalsIgnoreCase("azure_default")) {
+    if (mqttClientId.length() == 0) {
+      SerialMon.println("azure_default requested but mqttClientId is empty. Aborting publish.");
+      return false;
+    }
+    finalTopic = "devices/" + mqttClientId + "/messages/events/";
+    SerialMon.printf("Using Azure default topic mapping: %s\n", finalTopic.c_str());
+  }
 
-  modem.sendAT("+SMPUB=\"" + topic + "\"," + String(length) + "," + String(qos) + ",0");
+  int length = json.length();
+  SerialMon.printf("Publishing via MQTT: topic=%s len=%d qos=%d\n", finalTopic.c_str(), length, qos);
+
+  modem.sendAT("+SMPUB=\"" + finalTopic + "\"," + String(length) + "," + String(qos) + ",0");
   if (modem.waitResponse(">") != 1) {
     SerialMon.println("SMPUB prompt not received");
     return false;
