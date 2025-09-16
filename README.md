@@ -242,6 +242,41 @@ graph LR
   - IoT Hub 直結要件（参考）：IoT Hub に直接 MQTT で接続する場合、トピックは devices/{deviceId}/messages/events/ 固定、USERNAME/PASSWORD は SAS トークンが必要です。本ファームウェアは平文MQTTで Beam 経由を前提としており TLS/SAS の生成はしません。
   - セキュリティ: 平文MQTT（TLS未対応）。
 
+### Azure IoT Hub 連携時の ClientID と DeviceId の一致要件
+
+- 本ファームウェアは MQTT ClientID を [cpp.mqttConfigure()](src/main.cpp:1090) で決定し、SIM7080へ SMCONF "CLIENTID" として設定します。決定優先順は以下です（可視ASCIIへサニタイズ）:
+  1) SIMタグ azure_device_name
+  2) SIMタグ name
+  3) IMSI
+  4) IMEI
+- メタデータ topic が "azure_default" の場合、送信直前に [cpp.mqttPublish()](src/main.cpp:1311) でトピックを devices/{clientId}/messages/events/ に自動変換します。ここで {clientId} は SMCONF で実際に設定した ClientID 値（= mqttClientId）です。
+- IoT Hub 側でメッセージを正しく受信・属性付けするために、「ClientID（=デバイス側）」と「IoT Hub の DeviceId（=クラウド側）」は同一である必要があります。不一致の場合、認可やルーティングの都合で期待通りに処理されない可能性があります。
+
+### ClientID を SIM タグから設定する手順
+
+1. SORACOM コンソール → SIM 一覧 → 対象 SIM → 「タグ」タブを開きます。
+2. キー azure_device_name を追加し、値に IoT Hub の DeviceId を入力して保存します。
+   - 例: DeviceId が testabc1234 の場合、azure_device_name = testabc1234
+   - azure_device_name が未設定の場合は name タグが次順位で使用されます。
+3. デバイスを再起動するか、次サイクルまで待つと、[cpp.mqttConfigure()](src/main.cpp:1090) によりタグ値が取得され、SMCONF "CLIENTID" に反映されます。シリアルログには「SMCONF CLIENTID set to: <値> (source=sim-tag:...)」が出力されます。
+4. 併せて、Azure IoT Hub 側に同一の DeviceId を持つデバイスを作成し、SORACOM Beam の Azure IoT Hub 設定で azureIoTCredential にその「デバイス接続文字列（HostName;DeviceId;SharedAccessKey）」を設定してください（useClientCert=false が既定）。
+
+補足（設定例）
+- メタデータ（Azure 既定トピックを使う場合の最小構成）:
+  ```json
+  {
+    "interval_s": 5,
+    "mqtt": true,
+    "topic": "azure_default",
+    "qos": 1
+  }
+  ```
+- SIMタグ:
+  - azure_device_name = testabc1234
+- Azure:
+  - IoT Hub に DeviceId "testabc1234" を作成
+  - Beam の azureIoTCredential に当該デバイスの接続文字列を設定
+
 ## データフォーマット
 
 デバイスはUDPでバイナリデータを送信します。データ形式は以下の通りです：
